@@ -1,12 +1,129 @@
 import prisma from "@/lib/prisma";
 import { NextResponse } from "next/server";
 
+const MAX_DATABASE_ATTEMPTS = 3;
+const RETRYABLE_DATABASE_CODES = new Set([
+  "P1001", // database server unreachable
+  "P1002", // database server timeout
+  "P1008", // operation timeout
+  "P1017", // server closed the connection
+  "P2024", // connection pool timeout
+  "P2034", // transaction conflict
+  "P2037", // too many database connections
+]);
+
+const delay = (milliseconds: number) =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function getErrorDetails(error: unknown) {
+  const value = error as { name?: string; code?: string; message?: string };
+  return {
+    name: value?.name || "UnknownError",
+    code: value?.code,
+    message: value?.message || String(error),
+  };
+}
+
+function isRetryableDatabaseError(error: unknown) {
+  const { code, message } = getErrorDetails(error);
+  return (
+    (!!code && RETRYABLE_DATABASE_CODES.has(code)) ||
+    /timed out|timeout|connection reset|connection refused|connection closed|server has closed|temporarily unavailable|network error/i.test(
+      message
+    )
+  );
+}
+
+function isUniqueConstraintError(error: unknown) {
+  return getErrorDetails(error).code === "P2002";
+}
+
+async function withDatabaseRetries<T>(
+  operationName: string,
+  operation: () => Promise<T>
+): Promise<T> {
+  for (let attempt = 1; attempt <= MAX_DATABASE_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      const retryable = isRetryableDatabaseError(error);
+      if (!retryable || attempt === MAX_DATABASE_ATTEMPTS) {
+        throw error;
+      }
+
+      const waitMilliseconds = 250 * 2 ** (attempt - 1);
+      console.warn("Falha transitória no banco; repetindo webhook", {
+        operationName,
+        attempt,
+        nextAttempt: attempt + 1,
+        waitMilliseconds,
+        ...getErrorDetails(error),
+      });
+      await delay(waitMilliseconds);
+    }
+  }
+
+  throw new Error(`Falha ao executar operação do banco: ${operationName}`);
+}
+
+async function upsertClerkUser({
+  clerkId,
+  email,
+  firstName,
+  lastName,
+  profileImage,
+}: {
+  clerkId: string;
+  email: string;
+  firstName: string;
+  lastName: string | null;
+  profileImage: string;
+}) {
+  const update = { clerkId, email, firstName, lastName, profileImage };
+  const userByClerkId = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true },
+  });
+
+  if (userByClerkId) {
+    return prisma.user.update({ where: { clerkId }, data: update });
+  }
+
+  try {
+    // Email is unique; upsert makes duplicate Clerk deliveries safe.
+    return await prisma.user.upsert({
+      where: { email },
+      update,
+      create: update,
+    });
+  } catch (error) {
+    // A parallel delivery may have inserted the same Clerk ID under a new email.
+    if (!isUniqueConstraintError(error)) {
+      throw error;
+    }
+
+    const userCreatedByConcurrentDelivery = await prisma.user.findUnique({
+      where: { clerkId },
+      select: { id: true },
+    });
+    if (!userCreatedByConcurrentDelivery) {
+      throw error;
+    }
+
+    return prisma.user.update({ where: { clerkId }, data: update });
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
     const { type, data } = body;
     
-    console.log("Clerk webhook received:", { type, userId: data?.id });
+    console.log("Clerk webhook received:", { type });
+
+    if (!data || typeof data !== "object") {
+      return new NextResponse("Dados do evento são obrigatórios", { status: 400 });
+    }
 
     // Verificar se é um evento de delete
     if (type === "user.deleted") {
@@ -18,24 +135,17 @@ export async function POST(req: Request) {
       }
 
       // Buscar usuário no banco pelo clerkId
-      const user = await prisma.user.findFirst({ 
-        where: { clerkId },
-        include: {
-          certificates: true,
-          lectures: true,
-          Exam: true,
-          Damage: true,
-          ExamAttempt: true
-        }
-      });
+      const user = await withDatabaseRetries("lookup deleted user", () =>
+        prisma.user.findUnique({ where: { clerkId }, select: { id: true } })
+      );
 
       if (!user) {
-        console.log(`Usuário com clerkId ${clerkId} não encontrado no banco`);
-        return new NextResponse("Usuário não encontrado", { status: 404 });
+        // Delete deliveries can be replayed after the original already succeeded.
+        return new NextResponse("Usuário já removido", { status: 200 });
       }
 
       // Deletar dados relacionados e o usuário
-      await prisma.$transaction(async (tx) => {
+      await withDatabaseRetries("delete user", () => prisma.$transaction(async (tx) => {
         // Deletar tentativas de exame do usuário (deve ser deletado antes dos exames)
         await tx.examAttempt.deleteMany({
           where: { userId: user.id }
@@ -62,55 +172,40 @@ export async function POST(req: Request) {
         });
 
         // Deletar o usuário
-        await tx.user.delete({
+        await tx.user.deleteMany({
           where: { id: user.id }
         });
-      });
+      }));
 
-      console.log(`Usuário ${user.email} (${clerkId}) deletado com sucesso do banco de dados`);
+      console.log("Usuário do Clerk removido do banco de dados");
       return new NextResponse("Usuário deletado com sucesso", { status: 200 });
     }
 
     // Eventos de criação/atualização (comportamento original)
     if (type === "user.created" || type === "user.updated") {
       const { id, email_addresses, first_name, last_name, image_url } = data;
-      const email = email_addresses[0]?.email_address;
+      const email = Array.isArray(email_addresses)
+        ? email_addresses[0]?.email_address
+        : undefined;
 
-      if (!email) {
-        console.error("Email não encontrado nos dados do usuário");
-        return new NextResponse("Email é obrigatório", { status: 400 });
+      if (typeof id !== "string" || !id || !email) {
+        console.error("Webhook de usuário sem ID ou email válido", { type });
+        return new NextResponse("ID e email são obrigatórios", { status: 400 });
       }
 
       // Processar firstName e lastName
       const firstName = first_name?.trim() || 'Usuário';
       const lastName = last_name?.trim() || null;
 
-      const exists = await prisma.user.findFirst({ where: { email } });
-
-      if (exists) {
-        await prisma.user.update({
-          where: { email },
-          data: {
-            clerkId: id,
-            email,
-            firstName: firstName,
-            lastName: lastName,
-            profileImage: image_url || "",
-          },
-        });
-        console.log(`Usuário ${email} atualizado no banco de dados`);
-      } else {
-        await prisma.user.create({
-          data: {
-            clerkId: id,
-            email,
-            firstName: firstName,
-            lastName: lastName,
-            profileImage: image_url || "",
-          },
-        });
-        console.log(`Usuário ${email} criado no banco de dados`);
-      }
+      await withDatabaseRetries("upsert Clerk user", () =>
+        upsertClerkUser({
+          clerkId: id,
+          email,
+          firstName,
+          lastName,
+          profileImage: image_url || "",
+        })
+      );
 
       return new NextResponse("Usuário processado com sucesso", { status: 200 });
     }
@@ -120,7 +215,16 @@ export async function POST(req: Request) {
     return new NextResponse("Evento não processado", { status: 200 });
     
   } catch (error) {
-    console.error("Erro no webhook do Clerk:", error);
+    const retryable = isRetryableDatabaseError(error);
+    console.error("Erro no webhook do Clerk:", getErrorDetails(error));
+
+    if (retryable) {
+      return new NextResponse("Banco temporariamente indisponível", {
+        status: 503,
+        headers: { "Retry-After": "5" },
+      });
+    }
+
     return new NextResponse("Erro interno do servidor", { status: 500 });
   }
 }
