@@ -38,6 +38,23 @@ function isUniqueConstraintError(error: unknown) {
   return getErrorDetails(error).code === "P2002";
 }
 
+function webhookErrorResponse(
+  status: number,
+  code: string,
+  message: string,
+  deliveryId: string,
+  headers?: HeadersInit
+) {
+  return NextResponse.json(
+    {
+      success: false,
+      error: { code, message },
+      deliveryId,
+    },
+    { status, headers }
+  );
+}
+
 async function withDatabaseRetries<T>(
   operationName: string,
   operation: () => Promise<T>
@@ -115,14 +132,32 @@ async function upsertClerkUser({
 }
 
 export async function POST(req: Request) {
+  const deliveryId = req.headers.get("svix-id") || "unknown";
+
+  let body: any;
   try {
-    const body = await req.json();
-    const { type, data } = body;
-    
+    body = await req.json();
+  } catch {
+    return webhookErrorResponse(
+      400,
+      "INVALID_JSON",
+      "O corpo da entrega não contém um JSON válido.",
+      deliveryId
+    );
+  }
+
+  try {
+    const { type, data } = body || {};
+
     console.log("Clerk webhook received:", { type });
 
     if (!data || typeof data !== "object") {
-      return new NextResponse("Dados do evento são obrigatórios", { status: 400 });
+      return webhookErrorResponse(
+        400,
+        "INVALID_EVENT_DATA",
+        "Os dados do evento estão ausentes ou inválidos.",
+        deliveryId
+      );
     }
 
     // Verificar se é um evento de delete
@@ -131,7 +166,12 @@ export async function POST(req: Request) {
       
       if (!clerkId) {
         console.error("ClerkId não encontrado no evento de delete");
-        return new NextResponse("ClerkId é obrigatório para delete", { status: 400 });
+        return webhookErrorResponse(
+          400,
+          "USER_ID_REQUIRED",
+          "O evento de exclusão não contém o ID do usuário.",
+          deliveryId
+        );
       }
 
       // Buscar usuário no banco pelo clerkId
@@ -190,7 +230,12 @@ export async function POST(req: Request) {
 
       if (typeof id !== "string" || !id || !email) {
         console.error("Webhook de usuário sem ID ou email válido", { type });
-        return new NextResponse("ID e email são obrigatórios", { status: 400 });
+        return webhookErrorResponse(
+          400,
+          "USER_ID_AND_EMAIL_REQUIRED",
+          "O evento de usuário precisa conter ID e endereço de email.",
+          deliveryId
+        );
       }
 
       // Processar firstName e lastName
@@ -216,15 +261,26 @@ export async function POST(req: Request) {
     
   } catch (error) {
     const retryable = isRetryableDatabaseError(error);
-    console.error("Erro no webhook do Clerk:", getErrorDetails(error));
+    console.error("Erro no webhook do Clerk:", {
+      deliveryId,
+      ...getErrorDetails(error),
+    });
 
     if (retryable) {
-      return new NextResponse("Banco temporariamente indisponível", {
-        status: 503,
-        headers: { "Retry-After": "5" },
-      });
+      return webhookErrorResponse(
+        503,
+        "DATABASE_TEMPORARILY_UNAVAILABLE",
+        "O banco de dados não respondeu após as tentativas automáticas. A entrega pode ser repetida.",
+        deliveryId,
+        { "Retry-After": "5" }
+      );
     }
 
-    return new NextResponse("Erro interno do servidor", { status: 500 });
+    return webhookErrorResponse(
+      500,
+      "WEBHOOK_PROCESSING_FAILED",
+      "Não foi possível processar a entrega. Consulte os logs da função pelo ID da entrega.",
+      deliveryId
+    );
   }
 }
